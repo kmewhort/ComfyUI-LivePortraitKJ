@@ -41,6 +41,17 @@ from .liveportrait.modules.stitching_retargeting_network import (
 from .liveportrait.utils.camera import get_rotation_matrix
 from .liveportrait.utils.crop import _transform_img_kornia
 
+default_crop_mask = None
+
+def load_default_crop_mask():
+    global default_crop_mask
+    if default_crop_mask is None: 
+        script_directory = os.path.dirname(os.path.abspath(__file__))
+        default_mask_path = os.path.join(script_directory, "liveportrait", "utils", "resources", "mask_template.png")
+        default_crop_mask = cv2.imread(default_mask_path, cv2.IMREAD_COLOR)
+        default_crop_mask = torch.from_numpy(default_crop_mask)
+        default_crop_mask = default_crop_mask.unsqueeze(0).float() / 255.0
+    return default_crop_mask
 
 class InferenceConfig:
     def __init__(
@@ -364,9 +375,9 @@ class LivePortraitProcess:
             cropped_image_list = []
             for i in (range(total_frames)):
                 if not out["out_list"][i]:
-                    cropped_image_list.append(torch.zeros(1, 512, 512, 3, dtype=torch.float32, device = "cpu"))
+                    cropped_image_list.append(torch.zeros(1, 512, 512, 3, dtype=torch.float32, device = "cuda"))
                 else:
-                    cropped_image = torch.clamp(out["out_list"][i]["out"], 0, 1).permute(0, 2, 3, 1).cpu()
+                    cropped_image = torch.clamp(out["out_list"][i]["out"], 0, 1).permute(0, 2, 3, 1).cuda()
                     cropped_image_list.append(cropped_image)
 
             cropped_out_tensors = torch.cat(cropped_image_list, dim=0)
@@ -395,18 +406,12 @@ class LivePortraitComposite:
     )
     RETURN_NAMES = (
         "full_images",
-        "mask",
     )
     FUNCTION = "process"
     CATEGORY = "LivePortrait"
 
     def process(self, source_image, cropped_image, liveportrait_out, mask=None):
-        mm.soft_empty_cache()
-        gc.collect()
-        device = mm.get_torch_device()
-        if mm.is_device_mps(device): 
-            device = torch.device('cpu') #this function returns NaNs on MPS, defaulting to CPU
-
+        device = 'cuda'
         B, H, W, C = source_image.shape
         source_image = source_image.permute(0, 3, 1, 2) # B,H,W,C -> B,C,H,W
         cropped_image = cropped_image.permute(0, 3, 1, 2)
@@ -418,19 +423,15 @@ class LivePortraitComposite:
                 crop_mask = mask.unsqueeze(-1).expand(-1, -1, -1, 3)
         else:
             log.info("Using default mask template")
-            crop_mask = cv2.imread(os.path.join(script_directory, "liveportrait", "utils", "resources", "mask_template.png"), cv2.IMREAD_COLOR)
-            crop_mask = torch.from_numpy(crop_mask)
-            crop_mask = crop_mask.unsqueeze(0).float() / 255.0
+            crop_mask = load_default_crop_mask()
 
         crop_info = liveportrait_out["crop_info"]
         composited_image_list = []
-        out_mask_list = []
 
         total_frames = len(liveportrait_out["out_list"])
         log.info(f"Total frames: {total_frames}")
 
-        pbar = comfy.utils.ProgressBar(total_frames)
-        for i in tqdm(range(total_frames), desc='Compositing..', total=total_frames):
+        for i in range(total_frames):
             safe_index = min(i, len(crop_info["crop_info_list"]) - 1)
 
             if liveportrait_out["mismatch_method"] == "cut":
@@ -439,8 +440,7 @@ class LivePortraitComposite:
                 source_frame = _get_source_frame(source_image, i, liveportrait_out["mismatch_method"]).unsqueeze(0).to(device)
 
             if not liveportrait_out["out_list"][i]:
-                composited_image_list.append(source_frame.cpu())
-                out_mask_list.append(torch.zeros((1, 3, H, W), device="cpu"))
+                composited_image_list.append(source_frame.cuda())
             else:
                 cropped_image = torch.clamp(liveportrait_out["out_list"][i]["out"], 0, 1).permute(0, 2, 3, 1)
 
@@ -463,19 +463,13 @@ class LivePortraitComposite:
                         mask_ori * cropped_image_to_original + (1 - mask_ori) * source_frame, 0, 1
                         )
 
-                composited_image_list.append(cropped_image_to_original_blend.cpu())
-                out_mask_list.append(mask_ori.cpu())
-            pbar.update(1)
+                composited_image_list.append(cropped_image_to_original_blend.cuda())
 
         full_tensors_out = torch.cat(composited_image_list, dim=0)
         full_tensors_out = full_tensors_out.permute(0, 2, 3, 1)
 
-        mask_tensors_out = torch.cat(out_mask_list, dim=0)
-        mask_tensors_out = mask_tensors_out[:, 0, :, :]
-        
         return (
             full_tensors_out.float(), 
-            mask_tensors_out.float()
             )
     
 def _get_source_frame(source, idx, method):
@@ -499,8 +493,8 @@ class LivePortraitLoadCropper:
         return {"required": {
 
             "onnx_device": (
-                    ['CPU', 'CUDA', 'ROCM', 'CoreML'], {
-                        "default": 'CPU'
+                    ['cuda', 'CUDA', 'ROCM', 'CoreML'], {
+                        "default": 'cuda'
                     }),
             "keep_model_loaded": ("BOOLEAN", {"default": True})
             },
@@ -533,8 +527,8 @@ class LivePortraitLoadMediaPipeCropper:
         return {"required": {
 
             "landmarkrunner_onnx_device": (
-                    ['CPU', 'CUDA', 'ROCM', 'CoreML', 'torch_gpu'], {
-                        "default": 'CPU'
+                    ['cuda', 'CUDA', 'ROCM', 'CoreML', 'torch_gpu'], {
+                        "default": 'cuda'
                     }),
             "keep_model_loaded": ("BOOLEAN", {"default": True})
             },           
@@ -567,11 +561,11 @@ class LivePortraitLoadFaceAlignmentCropper:
                     }),
 
             "landmarkrunner_device": (
-                    ['CPU', 'CUDA', 'ROCM', 'CoreML', 'torch_gpu'], {
+                    ['cuda', 'CUDA', 'ROCM', 'CoreML', 'torch_gpu'], {
                         "default": 'torch_gpu'
                     }),
             "face_detector_device": (
-                    ['cuda', 'cpu', 'mps'], {
+                    ['cuda', 'cuda', 'mps'], {
                         "default": 'cuda'
                     }),
 
@@ -851,7 +845,7 @@ class KeypointScaler:
 
         keypoints_image = cv2.cvtColor(blank_image, cv2.COLOR_BGR2RGB)
         keypoints_image_tensor = torch.from_numpy(keypoints_image) / 255
-        keypoints_image_tensor = keypoints_image_tensor.unsqueeze(0).cpu().float()
+        keypoints_image_tensor = keypoints_image_tensor.unsqueeze(0).cuda().float()
         
         return (crop_info, keypoints_image_tensor,)
 
